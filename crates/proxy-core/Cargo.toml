@@ -1,0 +1,31 @@
+[package]
+name = "proxy-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# proxy-core is a self-contained engine — it does not depend on the rest of the workspace.
+# TLS/CA (rustls + rcgen) and the raw-send path are part of it.
+[dependencies]
+http-model = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+# aws-lc-rs (not ring) + prefer-post-quantum: offers the hybrid X25519MLKEM768 key exchange.
+# Without it weir can't establish TLS with PQ-only targets (modern ingresses / CTF), which reject
+# the classical groups with a handshake_failure alert. ring has no post-quantum support.
+rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12", "prefer-post-quantum"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
+rcgen = { version = "0.14.9", default-features = false, features = ["ring", "pem"] }
+webpki-roots = "1.0.9"
+hpack = "0.3.0"
+
+[dev-dependencies]
+h2 = "0.4.15"
+http = "1.5.0"
+tempfile = "3.27.0"

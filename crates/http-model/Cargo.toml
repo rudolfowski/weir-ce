@@ -1,0 +1,9 @@
+[package]
+name = "http-model"
+description = "Transport-level HTTP/WebSocket DTOs shared by the proxy engine and the rest of weir — raw, un-normalized request/response/frame types. Open-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }

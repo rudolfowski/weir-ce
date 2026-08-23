@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/http-model", "crates/proxy-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["rudolfowski"]
+
+[workspace.dependencies]
+http-model = { path = "crates/http-model" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tracing = "0.1"
+async-trait = "0.1"
