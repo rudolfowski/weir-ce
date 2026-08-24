@@ -167,6 +167,16 @@ async fn collect_body_capped(
     Ok(out)
 }
 
+/// How long a raw read waits for bytes that never come. It is a BACKSTOP for a stalled or
+/// close-delimited response, not the normal end of a read: with `Content-Length` or chunked framing
+/// the reader stops at the last body byte and never reaches it.
+const RAW_IDLE: Duration = Duration::from_secs(3);
+
+/// One byte-exact request, one framed response (§6.3). Framing is RFC 7230 (`ResponseReader`), the
+/// same as [`send_raw_sequence`]: against a keep-alive target an idle-terminated read would sit out
+/// the whole of [`RAW_IDLE`] on every send, turning a 6 ms replay into a 3 s one. A desync's EXTRA
+/// pipelined responses are not this function's job — a single-response signature cannot carry them;
+/// [`send_raw_sequence`] returns each one separately.
 async fn send_raw(
     request: &HttpRequest,
     t: &Target,
@@ -174,7 +184,9 @@ async fn send_raw(
 ) -> Result<HttpResponse, ProxyError> {
     let buf = build_raw_bytes(request, &t.path);
     let mut stream = connect_stream(t, tls).await?;
-    let raw = raw_exchange(&mut *stream, &buf).await?;
+    let mut reader = ResponseReader::new(&mut *stream);
+    reader.send(&buf).await?;
+    let raw = reader.next(RAW_IDLE).await?.unwrap_or_default();
     Ok(parse_raw_response(&raw))
 }
 
@@ -335,21 +347,18 @@ impl PrimedConn {
         s.flush().await.map_err(ProxyError::Io)
     }
 
-    /// Reads the response (best-effort, until EOF/idle ~3s) and parses it.
+    /// Reads THIS shot's response and parses it. Framed per RFC 7230 (`ResponseReader`), so the
+    /// read ends the moment the response is complete instead of waiting out [`RAW_IDLE`]: a
+    /// keep-alive target never closes the connection, so an idle-terminated read would charge every
+    /// single shot the full idle timeout. That is not a throughput detail — the caller reports
+    /// `time_ms` per shot as "how fast the target answered / who won the race", and a fixed +3 s on
+    /// every shot buries the millisecond spread that IS the race verdict.
     pub async fn read_response(mut self) -> Result<HttpResponse, ProxyError> {
-        let raw = read_raw_response(&mut *self.stream, Duration::from_secs(3)).await?;
+        let s: &mut dyn DuplexStream = &mut *self.stream;
+        let mut reader = ResponseReader::new(s);
+        let raw = reader.next(RAW_IDLE).await?.unwrap_or_default();
         Ok(parse_raw_response(&raw))
     }
-}
-
-/// Sends raw bytes and reads the response best-effort (until EOF or ~3s idle).
-async fn raw_exchange<S>(stream: &mut S, request: &[u8]) -> Result<Vec<u8>, ProxyError>
-where
-    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
-{
-    stream.write_all(request).await.map_err(ProxyError::Io)?;
-    stream.flush().await.map_err(ProxyError::Io)?;
-    read_raw_response(stream, Duration::from_secs(3)).await
 }
 
 /// Reads the response best-effort: until EOF or `idle` inactivity (cap 8 MiB).
