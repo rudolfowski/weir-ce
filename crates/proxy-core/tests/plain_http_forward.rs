@@ -122,6 +122,14 @@ async fn forwards_plain_http_and_captures_exchange() {
     let resp = ex.response.as_ref().expect("response present");
     assert_eq!(resp.status, 200);
     assert!(String::from_utf8_lossy(&resp.body).contains("echo:GET /echo"));
+
+    // The round trip is measured at the capture point. An absent value would mean the activity log
+    // shows a blank duration for every proxied request — the common case, and the one place where
+    // "how long did the target take" is asked most.
+    assert!(
+        ex.duration_ms.is_some(),
+        "the proxy must measure the target round trip"
+    );
 }
 
 #[tokio::test]
@@ -181,4 +189,129 @@ async fn refuses_non_loopback_bind() {
     // Invariant 10: binding outside loopback is forbidden.
     let err = bind("0.0.0.0:0".parse().unwrap()).await;
     assert!(err.is_err(), "bind on 0.0.0.0 must be rejected");
+}
+
+/// Sink that also records what the HTTP parser refused — the surface `on_client_rejected` adds.
+struct RejectSink {
+    captured: Mutex<Vec<CapturedExchange>>,
+    rejected: Mutex<Vec<(SocketAddr, String)>>,
+}
+
+impl ExchangeSink for RejectSink {
+    fn record(&self, captured: CapturedExchange) {
+        self.captured.lock().expect("sink mutex").push(captured);
+    }
+
+    fn on_client_rejected(&self, peer: SocketAddr, detail: &str) {
+        self.rejected
+            .lock()
+            .expect("reject mutex")
+            .push((peer, detail.to_owned()));
+    }
+}
+
+/// A request-target hyper refuses to parse must not vanish silently.
+///
+/// `<` is not a legal character in a request-target, so hyper answers 400 and never calls the
+/// service — `record` cannot see it. For an attack proxy that is precisely the case the operator
+/// needs told: the malformed target is usually deliberate, and without a signal a refused request
+/// is indistinguishable from one the target ignored.
+#[tokio::test]
+async fn malformed_request_target_is_surfaced_not_swallowed() {
+    let sink = Arc::new(RejectSink {
+        captured: Mutex::new(Vec::new()),
+        rejected: Mutex::new(Vec::new()),
+    });
+
+    let listener = bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind proxy");
+    let proxy_addr = listener.local_addr();
+    let serve_sink = sink.clone();
+    tokio::spawn(async move {
+        let _ = listener
+            .serve(
+                serve_sink,
+                test_tls(),
+                proxy_core::MatchReplace::new(),
+                std::sync::Arc::new(proxy_core::NoIntercept),
+            )
+            .await;
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    stream
+        .write_all(b"GET http://127.0.0.1/search?q=<b> HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .expect("write req");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read resp");
+    let raw = String::from_utf8_lossy(&buf).into_owned();
+    assert!(raw.starts_with("HTTP/1.1 400"), "status line: {raw}");
+
+    let mut rejected = Vec::new();
+    for _ in 0..50 {
+        rejected = sink.rejected.lock().unwrap().clone();
+        if !rejected.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        rejected.len(),
+        1,
+        "the refusal must reach the sink exactly once"
+    );
+    assert_eq!(
+        rejected[0].0.ip().to_string(),
+        "127.0.0.1",
+        "peer is carried through"
+    );
+    assert!(!rejected[0].1.is_empty(), "a reason is carried through");
+
+    // And it is NOT recorded as an exchange: nothing was sent, so nothing was exchanged.
+    assert!(
+        sink.captured.lock().unwrap().is_empty(),
+        "a refused request must not become an exchange"
+    );
+}
+
+/// The counter-case that keeps the hook from becoming log noise: an ordinary client disconnect is
+/// not a parse error, and must NOT be reported as a refusal.
+#[tokio::test]
+async fn client_hangup_is_not_reported_as_a_refusal() {
+    let sink = Arc::new(RejectSink {
+        captured: Mutex::new(Vec::new()),
+        rejected: Mutex::new(Vec::new()),
+    });
+
+    let listener = bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind proxy");
+    let proxy_addr = listener.local_addr();
+    let serve_sink = sink.clone();
+    tokio::spawn(async move {
+        let _ = listener
+            .serve(
+                serve_sink,
+                test_tls(),
+                proxy_core::MatchReplace::new(),
+                std::sync::Arc::new(proxy_core::NoIntercept),
+            )
+            .await;
+    });
+
+    // Connect, send half a request line, drop the connection.
+    let mut stream = TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    stream
+        .write_all(b"GET http://127.0.0.1/")
+        .await
+        .expect("write");
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(
+        sink.rejected.lock().unwrap().is_empty(),
+        "a hang-up mid-request is connection churn, not a refusal the operator must see"
+    );
 }

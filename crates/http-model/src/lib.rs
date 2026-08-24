@@ -46,6 +46,14 @@ pub struct CapturedExchange {
     pub host: String,
     pub request: HttpRequest,
     pub response: Option<HttpResponse>,
+    /// Round-trip to the target in milliseconds, when the capture point measured it.
+    ///
+    /// `None` means "not measured here", never "instant" — several capture points legitimately
+    /// have no single round-trip to report (a request replayed inside a keep-alive chain, a
+    /// synthesised error response). Consumers must render an absent value as unknown rather than
+    /// as zero.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 /// A match & replace rule applied to requests/responses as they pass through the proxy.

@@ -28,6 +28,15 @@ use http_model::{CapturedExchange, Header, HttpRequest, HttpResponse, WsDir, WsF
 pub trait ExchangeSink: Send + Sync {
     fn record(&self, captured: CapturedExchange);
 
+    /// A client request the HTTP parser REFUSED. hyper answers 400 and never calls the service, so
+    /// [`record`](Self::record) can never see it — without this hook the request vanishes entirely:
+    /// no exchange, no log row, nothing to notice. That silence is a real problem for an ATTACK
+    /// proxy specifically, where a malformed request-target is usually DELIBERATE (a raw `<`, a
+    /// space, a bare CR in the path) and "weir refused to send this" is exactly the fact the
+    /// operator needs — otherwise the request looks like it was sent and the target simply ignored
+    /// it. Defaults to a no-op, so sinks that don't care (tests) compile unchanged.
+    fn on_client_rejected(&self, _peer: SocketAddr, _detail: &str) {}
+
     /// A WS tunnel open, JUST before wiring up the frame pump — `target` is the `ws://`/`wss://`
     /// URL from the handshake. The impl (store) assigns a `conn_id` and publishes `StoreEvent::WsOpened`. Defaults
     /// to a no-op (id 0): sinks without WS support (e.g. in tests) still compile unchanged.
@@ -160,10 +169,11 @@ impl ProxyListener {
             intercept,
         });
         loop {
-            let (stream, _peer) = self.listener.accept().await.map_err(ProxyError::Accept)?;
+            let (stream, peer) = self.listener.accept().await.map_err(ProxyError::Accept)?;
             let io = TokioIo::new(stream);
             let ctx = ctx.clone();
             tokio::spawn(async move {
+                let sink = ctx.sink.clone();
                 let service = service_fn(move |req| {
                     let ctx = ctx.clone();
                     async move { handle_outer(req, ctx).await }
@@ -174,6 +184,13 @@ impl ProxyListener {
                     .with_upgrades()
                     .await
                 {
+                    // A PARSE error is the one kind worth surfacing: the client sent something and
+                    // weir refused it, unseen by the service and so unrecorded anywhere. Every
+                    // other variant here (client hung up, reset, idle timeout) is ordinary
+                    // connection churn that would only flood the operator's log.
+                    if e.is_parse() {
+                        sink.on_client_rejected(peer, &e.to_string());
+                    }
                     tracing::debug!(error = %e, "client connection error");
                 }
             });
@@ -414,9 +431,15 @@ async fn relay_core(
     }
     let out_req = out.body(Full::new(Bytes::from(request.body.clone())))?;
 
+    // Measured across the send AND the body read: a target that answers headers fast and then
+    // dribbles the body is slow from the client's seat, and that is the seat the log describes.
+    // Stopping the clock here, before match&replace and the response intercept hold, keeps it a
+    // measurement of the TARGET rather than of weir's own processing or the operator's think time.
+    let started = std::time::Instant::now();
     let upstream = send_upstream(host, port, scheme, out_req, ctx).await?;
     let (rparts, rbody) = upstream.into_parts();
     let resp_body = collect_capped(rbody).await?;
+    let duration_ms = started.elapsed().as_millis() as u64;
 
     let mut response = HttpResponse {
         status: rparts.status.as_u16(),
@@ -435,6 +458,7 @@ async fn relay_core(
 
     // The captured exchange (without an ID). We do NOT log bodies.
     ctx.sink.record(CapturedExchange {
+        duration_ms: Some(duration_ms),
         host: host.to_owned(),
         request,
         response: Some(response.clone()),
@@ -525,6 +549,9 @@ async fn relay_websocket(
 
     // Connection to the target (direct or via an upstream proxy). We negotiate WS over h1 — the connector
     // ALPN `http/1.1` (not h2; WS-over-h2/RFC 8441 out of scope).
+    // Timed from the dial, because for an upgrade the connection setup IS part of the handshake the
+    // operator is waiting on — there is no earlier request on this socket to attribute it to.
+    let handshake_started = std::time::Instant::now();
     let tcp = ctx.tls.dial(host, port).await?;
     let mut resp = match scheme {
         Scheme::Http => ws_handshake_over(TokioIo::new(tcp), handshake).await?,
@@ -567,6 +594,7 @@ async fn relay_websocket(
 
     // The target did not accept the upgrade (e.g. 400/426) — forward the response to the client buffered, like
     // a normal relay, and log the exchange.
+    let handshake_ms = handshake_started.elapsed().as_millis() as u64;
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
         let status = resp.status();
         let headers = capture_headers(resp.headers());
@@ -584,6 +612,7 @@ async fn relay_websocket(
             body: body.to_vec(),
         };
         ctx.sink.record(CapturedExchange {
+            duration_ms: Some(handshake_ms),
             host: host.to_owned(),
             request: req_model,
             response: Some(response.clone()),
@@ -606,6 +635,9 @@ async fn relay_websocket(
     // The 101 response to the client from the target headers (Sec-WebSocket-Accept etc.). Handshake to history.
     let resp_headers = capture_headers(resp.headers());
     ctx.sink.record(CapturedExchange {
+        // The handshake's round trip. The TUNNEL that follows can live for hours — its duration is
+        // not this number and is not a request duration at all; frames carry their own timeline.
+        duration_ms: Some(handshake_ms),
         host: host.to_owned(),
         request: req_model,
         response: Some(HttpResponse {
